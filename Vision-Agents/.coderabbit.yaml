@@ -1,0 +1,55 @@
+language: "en-US"
+tone_instructions: "Be direct, terse, pragmatic. No emojis, no praise, no filler, no metaphors. Findings are actionable items only."
+
+reviews:
+  profile: "chill"
+
+  high_level_summary: false
+
+  collapse_walkthrough: true
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+
+  poem: false
+  in_progress_fortune: false
+  review_status: false
+
+  enable_prompt_for_ai_agents: false
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+
+  auto_review:
+    enabled: true
+    drafts: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 50
+
+  path_instructions:
+    - path: "**/test_*.py"
+      instructions: |
+        Review pytest tests. Project uses uv.
+        - Integration tests must not mock; use real clients.
+        - Assert behavior and outputs, not initialization or call paths.
+        - Discourage verbosity and redundant tests.

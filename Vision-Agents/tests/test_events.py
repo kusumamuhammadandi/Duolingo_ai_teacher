@@ -1,0 +1,480 @@
+import asyncio
+import dataclasses
+import logging
+import types
+
+import pytest
+from vision_agents.core.events import BaseEvent
+from vision_agents.core.events.manager import EventManager, ExceptionEvent
+
+
+@dataclasses.dataclass
+class InvalidEvent:
+    # Missing `type` attribute and name does not end with 'Event'
+    field: int
+
+
+@dataclasses.dataclass
+class ValidEvent(BaseEvent):
+    field: int = 0
+    type: str = "custom.validevent"
+
+
+@dataclasses.dataclass
+class AnotherEvent(BaseEvent):
+    value: str = ""
+    type: str = "custom.anotherevent"
+
+
+class TestEventManager:
+    async def test_register_invalid_event_raises_value_error(self):
+        manager = EventManager()
+        with pytest.raises(ValueError):
+            manager.register(InvalidEvent)
+
+    async def test_register_valid_event_success(self):
+        manager = EventManager()
+        manager.register(ValidEvent)
+        # after registration the event type should be in the internal dict
+        assert "custom.validevent" in manager._events
+        manager.register(AnotherEvent)
+
+    async def test_register_multiple_valid_events_success(self):
+        manager = EventManager()
+        # Multiple events can be registered at once
+        manager.register(ValidEvent, AnotherEvent)
+        assert "custom.validevent" in manager._events
+        assert "custom.anotherevent" in manager._events
+
+    async def test_register_events_from_module_raises_name_error(self):
+        manager = EventManager()
+
+        # Create a dummy module with two event classes
+        dummy_module = types.SimpleNamespace(
+            MyEvent=ValidEvent,
+            Another=AnotherEvent,
+        )
+        dummy_module.__name__ = "dummy_module"
+        manager.register_events_from_module(dummy_module, prefix="custom.")
+
+        @manager.subscribe
+        async def my_handler(event: ValidEvent):
+            my_handler.value = event.field
+
+        manager.send(ValidEvent(field=2))
+        await manager.wait()
+        assert my_handler.value == 2
+
+    async def test_subscribe_success(self):
+        manager = EventManager()
+        manager.register(ValidEvent)
+        manager.register(AnotherEvent)
+
+        # Subscribe with a callback without return type
+        @manager.subscribe
+        async def on_valid_event(event1: ValidEvent):
+            pass
+
+        # The return types of the callbacks are ignored
+        @manager.subscribe
+        async def on_another_event(event1: AnotherEvent) -> None:
+            pass
+
+        assert manager.has_subscribers(ValidEvent)
+        assert manager.has_subscribers(AnotherEvent)
+
+    async def test_subscribe_with_multiple_events_different(self):
+        manager = EventManager()
+        manager.register(ValidEvent)
+        manager.register(AnotherEvent)
+
+        with pytest.raises(RuntimeError):
+
+            @manager.subscribe
+            async def multi_event_handler(event1: ValidEvent, event2: AnotherEvent):
+                pass
+
+    async def test_subscribe_with_multiple_events_as_one_processes(self):
+        manager = EventManager()
+        manager.register(ValidEvent)
+        manager.register(AnotherEvent)
+        value = 0
+
+        @manager.subscribe
+        async def multi_event_handler(event: ValidEvent | AnotherEvent):
+            nonlocal value
+            value += 1
+
+        manager.send(ValidEvent(field=1))
+        manager.send(AnotherEvent(value="2"))
+        await manager.wait()
+
+        assert value == 2
+
+    async def test_subscribe_unregistered_event_raises_key_error(self):
+        manager = EventManager(ignore_unknown_events=False)
+
+        with pytest.raises(KeyError):
+
+            @manager.subscribe
+            async def unknown_handler(event: ValidEvent):
+                pass
+
+    async def test_handler_exception_triggers_recursive_exception_event(self):
+        manager = EventManager()
+        manager.register(ValidEvent, ignore_not_compatible=False)
+        manager.register(ExceptionEvent)
+
+        # Counter to ensure recursive handler is invoked
+        recursive_counter = {"count": 0}
+
+        @manager.subscribe
+        async def failing_handler(event: ValidEvent):
+            raise RuntimeError("Intentional failure")
+
+        @manager.subscribe
+        async def exception_handler(event: ExceptionEvent):
+            # Increment the counter each time the exception handler runs
+            recursive_counter["count"] += 1
+            # Re-raise the exception only once to trigger a second recursion
+            if recursive_counter["count"] == 1:
+                raise ValueError("Re-raising in exception handler")
+
+        manager.send(ValidEvent(field=10))
+        await manager.wait()
+
+        # After processing, the recursive counter should be 2 (original failure + one re-raise)
+        assert recursive_counter["count"] == 2
+
+    async def test_send_unknown_event_type_raises_runtime_error(self):
+        manager = EventManager(ignore_unknown_events=False)
+
+        # Define a dynamic event class that is not registered
+        @dataclasses.dataclass
+        class UnregisteredEvent:
+            data: str
+            type: str = "custom.unregistered"
+
+        # send() raises synchronously when the event type is not registered
+        with pytest.raises(RuntimeError):
+            manager.send(UnregisteredEvent(data="oops"))
+
+    async def test_merge_managers_events_processed_in_one(self):
+        """Test that when two managers are merged, events from both are processed in the merged manager."""
+        # Create two separate managers
+        manager1 = EventManager()
+        manager2 = EventManager()
+
+        # Register different events in each manager
+        manager1.register(ValidEvent)
+        manager2.register(AnotherEvent)
+
+        # Set up handlers in each manager
+        all_events_processed: list[tuple[str, ValidEvent | AnotherEvent]] = []
+
+        @manager1.subscribe
+        async def manager1_handler(event: ValidEvent):
+            all_events_processed.append(("manager1", event))
+
+        @manager2.subscribe
+        async def manager2_handler(event: AnotherEvent):
+            all_events_processed.append(("manager2", event))
+
+        # Send events to both managers before merging
+        manager1.send(ValidEvent(field=1))
+        manager2.send(AnotherEvent(value="test"))
+
+        # Wait for events to be processed in their respective managers
+        await manager1.wait()
+        await manager2.wait()
+
+        # Verify events were processed in their original managers
+        assert len(all_events_processed) == 2
+        assert all_events_processed[0][0] == "manager1"
+        assert isinstance(all_events_processed[0][1], ValidEvent)
+        assert all_events_processed[0][1].field == 1
+        assert all_events_processed[1][0] == "manager2"
+        assert isinstance(all_events_processed[1][1], AnotherEvent)
+        assert all_events_processed[1][1].value == "test"
+
+        # Clear the processed events list
+        all_events_processed.clear()
+
+        # Merge manager2 into manager1
+        manager1.merge(manager2)
+
+        # After merge, child aliases parent's handler-task set so wait() on
+        # either manager observes tasks created via either send()
+        assert manager2._handler_tasks is manager1._handler_tasks
+
+        # Send new events to both managers after merging
+        manager1.send(ValidEvent(field=2))
+        manager2.send(AnotherEvent(value="merged"))
+
+        # Waiting on either manager should drain both
+        await manager1.wait()
+
+        # After merging, both events should be processed via the shared handler set
+        assert len(all_events_processed) == 2
+        assert all_events_processed[0][0] == "manager1"  # ValidEvent
+        assert isinstance(all_events_processed[0][1], ValidEvent)
+        assert all_events_processed[0][1].field == 2
+        assert (
+            all_events_processed[1][0] == "manager2"
+        )  # AnotherEvent (handler from manager2)
+        assert isinstance(all_events_processed[1][1], AnotherEvent)
+        assert all_events_processed[1][1].value == "merged"
+
+        # Verify that manager2 can still send events and they are dispatched via
+        # the shared handler map
+        all_events_processed.clear()
+        manager2.send(AnotherEvent(value="from_manager2"))
+        await manager1.wait()
+
+        # The event from manager2 should be processed by manager1's task
+        assert len(all_events_processed) == 1
+        assert all_events_processed[0][0] == "manager2"  # Handler from manager2
+        assert isinstance(all_events_processed[0][1], AnotherEvent)
+        assert all_events_processed[0][1].value == "from_manager2"
+
+    async def test_merge_managers_preserves_silent_events(self, caplog):
+        """Test that when two managers are merged, silent events from both are preserved."""
+
+        manager1 = EventManager()
+        manager2 = EventManager()
+
+        manager1.register(ValidEvent)
+        manager2.register(AnotherEvent)
+
+        # Mark ValidEvent as silent in manager1
+        manager1.silent(ValidEvent)
+        # Mark AnotherEvent as silent in manager2
+        manager2.silent(AnotherEvent)
+
+        handler_called = []
+
+        @manager1.subscribe
+        async def valid_handler(event: ValidEvent):
+            handler_called.append("valid")
+
+        @manager2.subscribe
+        async def another_handler(event: AnotherEvent):
+            handler_called.append("another")
+
+        # Merge manager2 into manager1
+        manager1.merge(manager2)
+
+        # Verify that both silent events are preserved
+        assert "custom.validevent" in manager1._silent_events
+        assert "custom.anotherevent" in manager1._silent_events
+
+        # Verify that manager2 also references the merged silent events
+        assert manager2._silent_events is manager1._silent_events
+
+        # Capture logs at INFO level
+        with caplog.at_level(logging.INFO):
+            # Send both events
+            manager1.send(ValidEvent(field=42))
+            manager1.send(AnotherEvent(value="test"))
+            await manager1.wait()
+
+        # Both handlers should have been called
+        assert handler_called == ["valid", "another"]
+
+        # Check log messages
+        log_messages = [record.message for record in caplog.records]
+
+        # Should NOT see "Called handler" for either event (both are silent)
+        assert not any("Called handler valid_handler" in msg for msg in log_messages)
+        assert not any("Called handler another_handler" in msg for msg in log_messages)
+
+    async def test_merge_preserves_in_flight_tasks_from_child(self):
+        """Tasks dispatched on em before merge must remain visible to self.wait()."""
+        manager1 = EventManager()
+        manager2 = EventManager()
+
+        manager2.register(ValidEvent)
+
+        completed = False
+
+        @manager2.subscribe
+        async def slow_handler(event: ValidEvent):
+            nonlocal completed
+            await asyncio.sleep(0.05)
+            completed = True
+
+        manager2.send(ValidEvent(field=1))
+        # Yield so the task is scheduled but not yet finished
+        await asyncio.sleep(0)
+
+        manager1.merge(manager2)
+
+        await manager1.wait(timeout=2.0)
+
+        assert completed is True
+
+    async def test_merge_preserves_handlers_when_event_types_overlap(self):
+        """Overlapping event-type keys must accumulate handlers, not replace them."""
+        manager1 = EventManager()
+        manager2 = EventManager()
+
+        manager1.register(ValidEvent)
+        manager2.register(ValidEvent)
+
+        called: list[str] = []
+
+        @manager1.subscribe
+        async def handler_a(event: ValidEvent):
+            called.append("a")
+
+        @manager2.subscribe
+        async def handler_b(event: ValidEvent):
+            called.append("b")
+
+        manager1.merge(manager2)
+
+        manager1.send(ValidEvent(field=1))
+        await manager1.wait(timeout=2.0)
+
+        assert sorted(called) == ["a", "b"]
+
+    async def test_subscribe_same_handler_twice_runs_once(self):
+        """Subscribing the same function twice on one manager must not double-invoke it."""
+        manager = EventManager()
+        manager.register(ValidEvent)
+
+        called: list[int] = []
+
+        async def handler(event: ValidEvent):
+            called.append(event.field)
+
+        manager.subscribe(handler)
+        manager.subscribe(handler)
+
+        manager.send(ValidEvent(field=7))
+        await manager.wait(timeout=2.0)
+
+        assert called == [7]
+
+    async def test_merge_does_not_duplicate_shared_handler(self):
+        """The same function registered on both managers must run only once after merge."""
+        manager1 = EventManager()
+        manager2 = EventManager()
+
+        manager1.register(ValidEvent)
+        manager2.register(ValidEvent)
+
+        called: list[int] = []
+
+        async def shared_handler(event: ValidEvent):
+            called.append(event.field)
+
+        manager1.subscribe(shared_handler)
+        manager2.subscribe(shared_handler)
+
+        manager1.merge(manager2)
+
+        manager1.send(ValidEvent(field=1))
+        await manager1.wait(timeout=2.0)
+
+        assert called == [1]
+
+    async def test_wait_completes_when_handler_tasks_finish(self):
+        """wait() should return promptly once all handler tasks are done."""
+        manager = EventManager()
+        manager.register(ValidEvent)
+
+        called = False
+
+        @manager.subscribe
+        async def on_event(event: ValidEvent):
+            nonlocal called
+            called = True
+
+        manager.send(ValidEvent(field=1))
+        await manager.wait(timeout=2.0)
+
+        assert called
+
+    async def test_has_subscribers(self):
+        manager = EventManager()
+        assert not manager.has_subscribers(ValidEvent)
+        manager.register(ValidEvent)
+
+        @manager.subscribe
+        async def on_event(event: ValidEvent): ...
+
+        assert manager.has_subscribers(ValidEvent)
+
+    async def test_shutdown_cancels_handler_tasks(self):
+        """shutdown() should cancel pending handler tasks before clearing state."""
+        manager = EventManager()
+        manager.register(ValidEvent)
+
+        handler_started = asyncio.Event()
+        handler_cancelled = asyncio.Event()
+
+        @manager.subscribe
+        async def slow_handler(event: ValidEvent):
+            try:
+                handler_started.set()
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                handler_cancelled.set()
+                raise
+
+        manager.send(ValidEvent(field=1))
+        await handler_started.wait()
+
+        await manager.shutdown()
+
+        assert handler_cancelled.is_set()
+        assert len(manager._handler_tasks) == 0
+        assert len(manager._handlers) == 0
+
+    async def test_send_after_shutdown_is_dropped(self):
+        """send() after shutdown() must drop the event and not invoke handlers."""
+        manager = EventManager()
+        manager.register(ValidEvent)
+
+        called = False
+
+        @manager.subscribe
+        async def on_event(event: ValidEvent):
+            nonlocal called
+            called = True
+
+        await manager.shutdown()
+
+        manager.send(ValidEvent(field=1))
+        # Yield once so any (incorrectly) scheduled task would get to run
+        await asyncio.sleep(0)
+
+        assert called is False
+        assert len(manager._handler_tasks) == 0
+
+    async def test_handler_tasks_removes_ref_when_done(self):
+        """
+        Event handler tasks should remove references to themselves after they're done
+        """
+        manager = EventManager()
+        manager.register(ValidEvent)
+
+        done = asyncio.Event()
+
+        @manager.subscribe
+        async def slow_handler(event: ValidEvent):
+            await done.wait()
+
+        manager.send(ValidEvent(field=1))
+        # Let the internal loop run
+        await asyncio.sleep(0)
+        # The task must be running
+        assert len(manager._handler_tasks) == 1
+
+        done.set()
+        # Wait a little bit because done callbacks are not fired immediately
+        await asyncio.sleep(0.05)
+
+        # The task must remove itself from the set
+        assert len(manager._handler_tasks) == 0

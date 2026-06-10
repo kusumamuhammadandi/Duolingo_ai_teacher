@@ -1,0 +1,54 @@
+name: CI (unit)
+on:
+  push:
+    branches: [ "**" ]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.gif'
+      - '**/*.mp3'
+      - '**/*.mp4'
+      - '**/*.wav'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.dockerignore'
+      - '.git-blame-ignore-revs'
+      - 'assets/**'
+      - 'docs/**'
+      - '.coderabbit.yaml'
+      - '.cursor/**'
+      - '.claude/**'
+      - '.idea/**'
+  pull_request:
+    branches: [ "**" ]
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.gif'
+      - '**/*.mp3'
+      - '**/*.mp4'
+      - '**/*.wav'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.dockerignore'
+      - '.git-blame-ignore-revs'
+      - 'assets/**'
+      - 'docs/**'
+      - '.coderabbit.yaml'
+      - '.cursor/**'
+      - '.claude/**'
+      - '.idea/**'
+
+jobs:
+  unit:
+    uses: ./.github/workflows/run_tests.yml
+    with:
+      marker: 'not integration'
+    secrets: inherit
+
+# Cancel in-flight runs for the same branch/PR when new commits arrive
+concurrency:
+  group: ci-unit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
